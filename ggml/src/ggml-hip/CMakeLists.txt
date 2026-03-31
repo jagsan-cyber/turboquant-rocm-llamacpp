@@ -143,3 +143,10 @@ if (GGML_STATIC)
 endif()
 
 target_link_libraries(ggml-hip PRIVATE ggml-base hip::host roc::rocblas roc::hipblas)
+
+if (LLAMA_TURBOQUANT)
+    add_subdirectory(../turboquant_rocm turboquant_rocm)
+    target_link_libraries(ggml-hip PRIVATE turboquant_rocm)
+    add_compile_definitions(LLAMA_TURBOQUANT)
+endif()
+

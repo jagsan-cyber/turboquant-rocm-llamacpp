@@ -1,4 +1,5 @@
 #include "llama-context.h"
+#include "turboquant.h"
 
 #include "llama-arch.h"
 #include "llama-impl.h"
@@ -29,6 +30,12 @@ llama_context::llama_context(
     // TODO warning when creating llama_context with awkward ctx size that is not a power of 2,
     //     may need to be backend-dependent
     LLAMA_LOG_INFO("%s: constructing llama_context\n", __func__);
+
+#ifdef LLAMA_TURBOQUANT
+    // Force shrink standard KV cache to the minimum valid type (IQ1_S) to save VRAM.
+    params.type_k = GGML_TYPE_IQ1_S;
+    params.type_v = GGML_TYPE_IQ1_S;
+#endif
 
     t_start_us = model.t_start_us;
     t_load_us  = model.t_load_us;
@@ -362,6 +369,16 @@ llama_context::llama_context(
             sampling.token_ids_full_vocab[i] = i;
         }
     }
+
+    // [TurboQuant Force-Enabled]
+    this->tq_ctx = llama_tq_create(
+        model.hparams.n_layer,
+        model.hparams.n_head_kv(0),
+        model.hparams.n_embd_head_k(0),
+        cparams.n_ctx,
+        3,  // key bits
+        2); // val bits
+    llama_tq_set_global(this->tq_ctx);
 }
 
 llama_context::~llama_context() {
@@ -382,6 +399,11 @@ llama_context::~llama_context() {
         }
     }
     ggml_opt_free(opt_ctx);
+
+    if (this->tq_ctx) {
+        llama_tq_free(this->tq_ctx);
+        this->tq_ctx = nullptr;
+    }
 }
 
 void llama_context::sched_reserve() {
@@ -2926,6 +2948,7 @@ llama_context * llama_init_from_model(
         LLAMA_LOG_ERROR("%s: model cannot be NULL\n", __func__);
         return nullptr;
     }
+
 
     if (params.n_batch == 0 && params.n_ubatch == 0) {
         LLAMA_LOG_ERROR("%s: n_batch and n_ubatch cannot both be zero\n", __func__);
