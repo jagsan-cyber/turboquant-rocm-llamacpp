@@ -3,6 +3,7 @@
  */
 
 #include "turboquant.h"
+#include "turboquant_hip.cuh" // 実装を直接注入
 #include <hip/hip_runtime.h>
 #include <cmath>
 #include <vector>
@@ -11,13 +12,7 @@
 #include <cstring>
 #include <cstdio>
 
-#define HIP_CHECK(ans) { gpuAssert((ans), __FILE__, __LINE__); }
-inline void gpuAssert(hipError_t code, const char *file, int line, bool abort=true) {
-    if (code != hipSuccess) {
-        fprintf(stderr,"GPUassert: %s %s %d\n", hipGetErrorString(code), file, line);
-        if (abort) exit(code);
-    }
-}
+#define HIP_CHECK(ans) { if ((ans) != hipSuccess) return -1; }
 
 static tq_codebook_t g_codebooks[3]; // 2, 3, 4 bit
 
@@ -94,32 +89,34 @@ int tq_kv_cache_alloc(tq_kv_cache_t *cache, const tq_config_t *cfg) {
     int    H  = cfg->n_heads_kv;
     int    T  = cfg->max_seq_len;
 
-    int k_bpv  = (d * cfg->key_bits + 7) / 8;  
-    int v_bpv  = (d * cfg->val_bits + 7) / 8;
-    int qjl_bpv = (d + 7) / 8;
+    // 128-byte aligned sizes for RDNA4 Infinity Cache optimization
+    int raw_k_bpv = (d * cfg->key_bits + 7) / 8;
+    int raw_v_bpv = (d * cfg->val_bits + 7) / 8;
+    int raw_qjl_bpv = (d + 7) / 8;
+    
+    // アラインされたサイズを計算
+    cache->aligned_bytes_per_key = ((raw_k_bpv + 127) / 128) * 128;
+    cache->aligned_bytes_per_val = ((raw_v_bpv + 127) / 128) * 128;
+    cache->aligned_bytes_per_qjl = ((raw_qjl_bpv + 127) / 128) * 128;
+    
+    int k_bpv = (int)cache->aligned_bytes_per_key;
+    int v_bpv = (int)cache->aligned_bytes_per_val;
     size_t total = (size_t)T * H;
 
-    HIP_CHECK(hipMalloc(&cache->d_keys_quant, total * k_bpv));
-    HIP_CHECK(hipMalloc(&cache->d_vals_quant, total * v_bpv));
-    HIP_CHECK(hipMalloc(&cache->d_keys_qjl,   total * qjl_bpv));
-    HIP_CHECK(hipMalloc(&cache->d_vals_qjl,   total * qjl_bpv));
+    // hipMallocは一般的に128-byteアラインされているが、明示的に確認
+    if (hipMalloc(&cache->d_keys_quant, total * k_bpv) != hipSuccess) return -1;
+    if (hipMalloc(&cache->d_vals_quant, total * v_bpv) != hipSuccess) return -1;
 
-    HIP_CHECK(hipMalloc(&cache->d_sign_k1, d * sizeof(float)));
-    HIP_CHECK(hipMalloc(&cache->d_sign_k2, d * sizeof(float)));
-    HIP_CHECK(hipMalloc(&cache->d_qjl_proj_k, d * d * sizeof(float)));
-    HIP_CHECK(hipMalloc(&cache->d_sign_v1, d * sizeof(float)));
-    HIP_CHECK(hipMalloc(&cache->d_sign_v2, d * sizeof(float)));
-    HIP_CHECK(hipMalloc(&cache->d_qjl_proj_v, d * d * sizeof(float)));
+    if (hipMalloc(&cache->d_sign_k1, d * sizeof(float)) != hipSuccess) return -1;
+    if (hipMalloc(&cache->d_sign_k2, d * sizeof(float)) != hipSuccess) return -1;
+    if (hipMalloc(&cache->d_sign_v1, d * sizeof(float)) != hipSuccess) return -1;
+    if (hipMalloc(&cache->d_sign_v2, d * sizeof(float)) != hipSuccess) return -1;
 
-    // Allocate scratch for batch processing (up to 2048 tokens)
-    size_t scratch_tokens = 2048;
+    // Allocate scratch for batch processing (1024 tokens)
+    size_t scratch_tokens = 1024;
     size_t scratch_sz = scratch_tokens * H * d * sizeof(float);
-    HIP_CHECK(hipMalloc(&cache->d_tmp_kf, scratch_sz));
-    HIP_CHECK(hipMalloc(&cache->d_tmp_vf, scratch_sz));
-    HIP_CHECK(hipMalloc(&cache->d_tmp_kf_orig, scratch_sz));
-    HIP_CHECK(hipMalloc(&cache->d_tmp_vf_orig, scratch_sz));
-    HIP_CHECK(hipMalloc(&cache->d_tmp_recon_k, scratch_sz));
-    HIP_CHECK(hipMalloc(&cache->d_tmp_recon_v, scratch_sz));
+    if (hipMalloc(&cache->d_tmp_kf, scratch_sz) != hipSuccess) return -1;
+    if (hipMalloc(&cache->d_tmp_vf, scratch_sz) != hipSuccess) return -1;
 
     std::vector<float> h_sign(d);
     std::mt19937 rng(TQ_SEED_ROTATION);
@@ -127,17 +124,11 @@ int tq_kv_cache_alloc(tq_kv_cache_t *cache, const tq_config_t *cfg) {
 
     auto fill_sign = [&](float *d_ptr) {
         for(int i=0; i<d; i++) h_sign[i] = (dist(rng) > 0) ? 1.0f : -1.0f;
-        HIP_CHECK(hipMemcpy(d_ptr, h_sign.data(), d*sizeof(float), hipMemcpyHostToDevice));
+        hipMemcpy(d_ptr, h_sign.data(), d*sizeof(float), hipMemcpyHostToDevice);
     };
 
     fill_sign(cache->d_sign_k1); fill_sign(cache->d_sign_k2);
     fill_sign(cache->d_sign_v1); fill_sign(cache->d_sign_v2);
-
-    std::vector<float> h_proj(d * d);
-    generate_random_ortho_matrix(h_proj.data(), d, d, TQ_SEED_QJL);
-    HIP_CHECK(hipMemcpy(cache->d_qjl_proj_k, h_proj.data(), d*d*sizeof(float), hipMemcpyHostToDevice));
-    generate_random_ortho_matrix(h_proj.data(), d, d, TQ_SEED_QJL ^ 0x1234);
-    HIP_CHECK(hipMemcpy(cache->d_qjl_proj_v, h_proj.data(), d*d*sizeof(float), hipMemcpyHostToDevice));
 
     cache->n_tokens = 0;
     return 0;
@@ -145,62 +136,52 @@ int tq_kv_cache_alloc(tq_kv_cache_t *cache, const tq_config_t *cfg) {
 
 void tq_kv_cache_free(tq_kv_cache_t *cache) {
     if (!cache) return;
-    hipFree(cache->d_keys_quant); hipFree(cache->d_vals_quant);
-    hipFree(cache->d_keys_qjl);   hipFree(cache->d_vals_qjl);
-    hipFree(cache->d_sign_k1);    hipFree(cache->d_sign_k2);   hipFree(cache->d_qjl_proj_k);
-    hipFree(cache->d_sign_v1);    hipFree(cache->d_sign_v2);   hipFree(cache->d_qjl_proj_v);
-    hipFree(cache->d_tmp_kf);     hipFree(cache->d_tmp_vf);
-    hipFree(cache->d_tmp_kf_orig); hipFree(cache->d_tmp_vf_orig);
-    hipFree(cache->d_tmp_recon_k); hipFree(cache->d_tmp_recon_v);
+    if (cache->d_keys_quant) hipFree(cache->d_keys_quant);
+    if (cache->d_vals_quant) hipFree(cache->d_vals_quant);
+    if (cache->d_sign_k1)    hipFree(cache->d_sign_k1);
+    if (cache->d_sign_k2)    hipFree(cache->d_sign_k2);
+    if (cache->d_sign_v1)    hipFree(cache->d_sign_v1);
+    if (cache->d_sign_v2)    hipFree(cache->d_sign_v2);
+    if (cache->d_tmp_kf)     hipFree(cache->d_tmp_kf);
+    if (cache->d_tmp_vf)     hipFree(cache->d_tmp_vf);
     memset(cache, 0, sizeof(*cache));
 }
 
 int tq_store_k(tq_kv_cache_t *cache, const void *d_keys_f32, const int *d_indices, int n_tokens) {
     const tq_config_t *cfg = &cache->cfg; int d = cfg->head_dim; int H = cfg->n_heads_kv; hipStream_t stream = nullptr;
-    float *d_kf = cache->d_tmp_kf; float *d_kf_orig = cache->d_tmp_kf_orig; float *d_recon_k = cache->d_tmp_recon_k;
+    float *d_kf = cache->d_tmp_kf;
     
     HIP_CHECK(hipMemcpyAsync(d_kf, d_keys_f32, (size_t)n_tokens * H * d * sizeof(float), hipMemcpyDeviceToDevice, stream));
-    HIP_CHECK(hipMemcpyAsync(d_kf_orig, d_kf, (size_t)n_tokens * H * d * sizeof(float), hipMemcpyDeviceToDevice, stream));
     
     tq_launch_rotate(d_kf, cache->d_sign_k1, cache->d_sign_k2, n_tokens, H, d, (tq_hip_stream_t)stream);
-    
-    tq_launch_quantize_scatter(d_kf, cache->d_keys_quant, d_recon_k, d_indices, n_tokens, H, d, cfg->key_bits, (tq_hip_stream_t)stream);
-    if (cfg->use_qjl) {
-        tq_launch_qjl_scatter(d_kf_orig, d_recon_k, cache->d_sign_k1, cache->d_sign_k2, cache->d_qjl_proj_k, cache->d_keys_qjl, d_indices, n_tokens, H, d, (tq_hip_stream_t)stream);
-    }
+    tq_launch_quantize_scatter(d_kf, cache->d_keys_quant, d_indices, n_tokens, H, d, cfg->key_bits, (tq_hip_stream_t)stream);
     return 0;
 }
 
 int tq_store_v(tq_kv_cache_t *cache, const void *d_vals_f32, const int *d_indices, int n_tokens) {
     const tq_config_t *cfg = &cache->cfg; int d = cfg->head_dim; int H = cfg->n_heads_kv; hipStream_t stream = nullptr;
-    float *d_vf = cache->d_tmp_vf; float *d_vf_orig = cache->d_tmp_vf_orig; float *d_recon_v = cache->d_tmp_recon_v;
+    float *d_vf = cache->d_tmp_vf;
     
     HIP_CHECK(hipMemcpyAsync(d_vf, d_vals_f32, (size_t)n_tokens * H * d * sizeof(float), hipMemcpyDeviceToDevice, stream));
-    HIP_CHECK(hipMemcpyAsync(d_vf_orig, d_vf, (size_t)n_tokens * H * d * sizeof(float), hipMemcpyDeviceToDevice, stream));
     
     tq_launch_rotate(d_vf, cache->d_sign_v1, cache->d_sign_v2, n_tokens, H, d, (tq_hip_stream_t)stream);
-    
-    tq_launch_quantize_scatter(d_vf, cache->d_vals_quant, d_recon_v, d_indices, n_tokens, H, d, cfg->val_bits, (tq_hip_stream_t)stream);
-    if (cfg->use_qjl) {
-        tq_launch_qjl_scatter(d_vf_orig, d_recon_v, cache->d_sign_v1, cache->d_sign_v2, cache->d_qjl_proj_v, cache->d_vals_qjl, d_indices, n_tokens, H, d, (tq_hip_stream_t)stream);
-    }
+    tq_launch_quantize_scatter(d_vf, cache->d_vals_quant, d_indices, n_tokens, H, d, cfg->val_bits, (tq_hip_stream_t)stream);
     return 0;
 }
 
-int tq_attn_logits(const tq_kv_cache_t *cache, const float *d_query, float *d_logits, int n_queries, int n_heads_q) {
+extern "C" int tq_attn_logits(const tq_kv_cache_t *cache, const float *d_query, float *d_logits, int n_queries, int n_heads_q) {
     const tq_config_t *c = &cache->cfg;
     return tq_launch_attn_logits(
-        d_query, cache->d_keys_quant, cache->d_keys_qjl,
-        cache->d_sign_k1, cache->d_sign_k2, cache->d_qjl_proj_k,
+        d_query, cache->d_keys_quant, cache->d_sign_k1, cache->d_sign_k2,
         d_logits,
         n_heads_q, c->n_heads_kv, c->head_dim, cache->n_tokens, n_queries, c->key_bits,
         nullptr);
 }
 
-int tq_attn_output(const tq_kv_cache_t *cache, const float *d_logits, float *d_output, int n_queries, int n_heads_q) {
+extern "C" int tq_attn_output(const tq_kv_cache_t *cache, const float *d_logits, float *d_output, int n_queries, int n_heads_q) {
     const tq_config_t *c = &cache->cfg;
     int r = tq_launch_attn_output(
-        d_logits, cache->d_vals_quant, cache->d_vals_qjl,
+        d_logits, cache->d_vals_quant,
         d_output,
         n_heads_q, c->n_heads_kv, c->head_dim, cache->n_tokens, n_queries, c->val_bits,
         nullptr);

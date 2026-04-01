@@ -12,6 +12,10 @@
 #include <map>
 #include <vector>
 
+#ifdef LLAMA_TURBOQUANT
+#include "turboquant_integration.h"
+#endif
+
 struct llama_model;
 class llama_batch_allocr;
 
@@ -356,4 +360,8 @@ private:
     mutable int32_t n_eval   = 0; // number of eval calls
 
     mutable int32_t n_reused = 0; // number of times the previous graph was reused
+
+#ifdef LLAMA_TURBOQUANT
+    turboquant_integration::llama_tq_integration * tq = nullptr;
+#endif
 };

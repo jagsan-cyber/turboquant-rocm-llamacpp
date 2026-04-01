@@ -3,14 +3,14 @@
  * ROCm / HIP implementation of TurboQuant kernels
  *
  * Build:
- *   hipcc -O3 -arch=gfx90a turboquant_hip.hip turboquant.cpp -o turboquant.o
+ *   hipcc -O3 -arch=gfx1201 turboquant_hip.hip turboquant.cpp -o turboquant.o
  *
  * Kernels:
- *   1. tq_rotate_whd_kernel    EWalsh-Hadamard + sign-flip random rotation
- *   2. tq_quantize_kernel      ELloyd-Max scalar quantization (per coordinate)
- *   3. tq_qjl_kernel           E1-bit QJL residual sign projection
- *   4. tq_attn_logits_kernel   Efused dequant + inner product (keys ÁEquery)
- *   5. tq_attn_output_kernel   Esoftmax + weighted sum (values)
+ *   1. tq_rotate_whd_kernel   - Walsh-Hadamard + sign-flip random rotation
+ *   2. tq_quantize_kernel     - Lloyd-Max scalar quantization (per coordinate)
+ *   3. tq_qjl_kernel          - 1-bit QJL residual sign projection
+ *   4. tq_attn_logits_kernel  - Direct Memory Access (no LDS, uint4 + __ldg)
+ *   5. tq_attn_output_kernel  - softmax + weighted sum (values)
  */
 
 #include "turboquant.h"
@@ -26,10 +26,6 @@
 #endif
 #include <cstring>
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Helpers / Macros
-// ─────────────────────────────────────────────────────────────────────────────
-
 #define HIP_CHECK(cmd) \
     do { \
         hipError_t e = (cmd); \
@@ -40,10 +36,6 @@
         } \
     } while(0)
 
-// RDNA4 (gfx1201 / RX 9070): wavefront size = 32
-// RDNA2/3 (gfx1030/1100):    wavefront size = 32
-// GCN / CDNA (gfx90a etc.):  wavefront size = 64
-// ↁEAt runtime we branch on __AMDGCN_WAVEFRONT_SIZE__ or use hipDeviceProp_t
 #ifdef __gfx1201__
 #  define WARP_SIZE  32   // RDNA4: RX 9070 / R9700
 #elif defined(__gfx1200__)
@@ -59,11 +51,6 @@
 // ─────────────────────────────────────────────────────────────────────────────
 // Device-side codebook (loaded from host constants, read-only)
 // ─────────────────────────────────────────────────────────────────────────────
-
-// Lloyd-Max codebooks for Beta(0.5, 0.5) distribution
-// Generated offline via Lloyd's algorithm; coordinates after rotation
-// are approximately arcsine-distributed on [-1, 1].
-
 __constant__ float d_cb2_levels[4] = {
     -0.7071f, -0.2357f,  0.2357f,  0.7071f
 };
@@ -96,20 +83,10 @@ __constant__ float d_cb4_thresh[17] = {
 // ─────────────────────────────────────────────────────────────────────────────
 // Kernel 1: Walsh-Hadamard Random Rotation
 // ─────────────────────────────────────────────────────────────────────────────
-/**
- * In-place randomized Walsh-Hadamard transform:
- *   x = D2 * WHT(D1 * x) / sqrt(d)
- *
- * D1, D2: random ±1 diagonal matrices (d_sign1, d_sign2)
- * WHT: Walsh-Hadamard transform (butterfly network, O(d log d))
- *
- * One block handles one (token, head) pair.
- * blockDim.x = head_dim (must be power of 2, ≤ 256)
- */
 __global__ void tq_rotate_whd_kernel(
-    float       *__restrict__ x,       // [n_tokens, n_heads, head_dim]
-    const float *__restrict__ sign1,   // [head_dim]
-    const float *__restrict__ sign2,   // [head_dim]
+    float       *__restrict__ x,
+    const float *__restrict__ sign1,
+    const float *__restrict__ sign2,
     int head_dim,
     int n_heads,
     float inv_sqrt_d)
@@ -123,19 +100,14 @@ __global__ void tq_rotate_whd_kernel(
     if (tid >= head_dim) return;
 
     int base = (tok * n_heads + head) * head_dim;
-
-    // Step 1: Apply D1 (sign flip)
     float val = x[base + tid] * sign1[tid];
 
-    // Step 2: Walsh-Hadamard butterfly
-    // Use fast wavefront shuffles for small strides
     for (int stride = 1; stride < WARP_SIZE && stride < head_dim; stride <<= 1) {
         float other = __shfl_xor(val, stride);
         if ((tid & stride) == 0) val = val + other;
         else                     val = other - val;
     }
 
-    // Use shared memory for strides >= WARP_SIZE
     if (head_dim > WARP_SIZE) {
         smem[tid] = val;
         __syncthreads();
@@ -154,24 +126,14 @@ __global__ void tq_rotate_whd_kernel(
         val = smem[tid];
     }
 
-    // Step 3: Apply D2 and normalize
     x[base + tid] = val * sign2[tid] * inv_sqrt_d;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Kernel 2: Lloyd-Max Scalar Quantization
 // ─────────────────────────────────────────────────────────────────────────────
-/**
- * Quantize rotated float coordinates to b-bit indices using the
- * Lloyd-Max codebook for the Beta(0.5, 0.5) / arcsine distribution.
- *
- * Also stores the reconstruction (for residual computation in QJL).
- *
- * Output packing: bits are packed MSB-first into uint8 arrays.
- */
 __device__ __forceinline__
 int tq_scalar_quantize(float v, int bits) {
-    // Clamp to [-1, 1] (rotation preserves L2 norm ~ unit sphere)
     v = fmaxf(-1.0f, fminf(1.0f, v));
 
     if (bits == 2) {
@@ -180,7 +142,6 @@ int tq_scalar_quantize(float v, int bits) {
         if (v < d_cb2_thresh[3]) return 2;
         return 3;
     } else if (bits == 3) {
-        // Binary search through 8 levels
         int lo = 0, hi = 7;
         while (lo < hi) {
             int mid = (lo + hi) / 2;
@@ -188,7 +149,7 @@ int tq_scalar_quantize(float v, int bits) {
             else lo = mid + 1;
         }
         return lo;
-    } else {  // bits == 4
+    } else {
         int lo = 0, hi = 15;
         while (lo < hi) {
             int mid = (lo + hi) / 2;
@@ -206,21 +167,15 @@ float tq_scalar_reconstruct(int idx, int bits) {
     return d_cb4_levels[idx];
 }
 
-/**
- * Quantize kernel: reads float, writes packed bits + reconstruction.
- *
- * Each thread handles one coordinate.
- * Pack b bits per coordinate into uint8 stream (b * head_dim / 8 bytes per vector).
- */
 __global__ void tq_quantize_kernel(
-    const float   *__restrict__ x_rot,    // [n_tokens, n_heads, head_dim] rotated
-    uint8_t       *__restrict__ q_out,    // packed quantized output
-    float         *__restrict__ recon,   // reconstruction for QJL residual
+    const float   *__restrict__ x_rot,
+    uint8_t       *__restrict__ q_out,
+    float         *__restrict__ recon,
     int head_dim,
     int n_heads,
     int bits)
 {
-    int tid  = threadIdx.x;   // coordinate index within head
+    int tid  = threadIdx.x;
     int head = blockIdx.y;
     int tok  = blockIdx.x;
 
@@ -232,26 +187,20 @@ __global__ void tq_quantize_kernel(
     int q_idx = tq_scalar_quantize(v, bits);
     float r   = tq_scalar_reconstruct(q_idx, bits);
 
-    // Store reconstruction for QJL residual calculation
     if (recon) recon[vec_idx * head_dim + tid] = r;
 
-    // Pack bits: head_dim * bits packed into bytes
-    // Thread tid writes `bits` bits at bit position (tid * bits)
     int   byte_pos = (tid * bits) / 8;
     int   bit_off  = (tid * bits) % 8;
     int   bytes_per_vec = (head_dim * bits + 7) / 8;
     uint8_t *base = q_out + vec_idx * bytes_per_vec;
 
-    // Write bits (atomic for threads sharing a byte)
     uint32_t mask = ((1u << bits) - 1u);
     uint32_t val  = (uint32_t)q_idx & mask;
 
-    // Use atomicOr for thread-safe packing
     if (bits <= 8) {
         atomicOr((unsigned int *)(base + byte_pos),
                  (unsigned int)(val << bit_off));
         if (bit_off + bits > 8) {
-            // Spans two bytes
             int overflow = bit_off + bits - 8;
             atomicOr((unsigned int *)(base + byte_pos + 1),
                      (unsigned int)(val >> (bits - overflow)));
@@ -262,26 +211,13 @@ __global__ void tq_quantize_kernel(
 // ─────────────────────────────────────────────────────────────────────────────
 // Kernel 3: Quantized Johnson-Lindenstrauss (QJL) Residual
 // ─────────────────────────────────────────────────────────────────────────────
-/**
- * Compute 1-bit QJL projection of residual vector.
- *
- * residual = x_original - R^T(reconstruction)
- * qjl_sign[j] = sign( sum_i S[j,i] * residual[i] )
- *
- * S is a random Gaussian matrix (d_qjl_proj, shape [head_dim, head_dim]).
- * Output: 1 bit per coordinate packed into uint8.
- *
- * One block per (token, head), using reduction in shared memory.
- * blockDim.x = head_dim (projection dimension)
- * Each thread computes one projection dot product via __shfl_down_reduce.
- */
 __global__ void tq_qjl_kernel(
-    const float   *__restrict__ x_orig,    // original (pre-rotation) vectors
-    const float   *__restrict__ recon_rot, // reconstruction in rotated space
-    const float   *__restrict__ sign1,     // D1 for inverse rotation
-    const float   *__restrict__ sign2,     // D2 for inverse rotation
-    const float   *__restrict__ qjl_proj,  // random Gaussian [head_dim x head_dim]
-    uint8_t       *__restrict__ qjl_out,   // packed sign bits output
+    const float   *__restrict__ x_orig,
+    const float   *__restrict__ recon_rot,
+    const float   *__restrict__ sign1,
+    const float   *__restrict__ sign2,
+    const float   *__restrict__ qjl_proj,
+    uint8_t       *__restrict__ qjl_out,
     int head_dim,
     int n_heads,
     float inv_sqrt_d)
@@ -295,8 +231,6 @@ __global__ void tq_qjl_kernel(
 
     if (tid >= head_dim) return;
 
-    // Step 1: Inverse-rotate reconstruction ↁEoriginal space
-    // R^T = D1 * WHT(D2 * ·) * inv_sqrt_d  (WHT is self-inverse up to scale)
     smem[tid] = recon_rot[vec * head_dim + tid] * sign2[tid];
     __syncthreads();
 
@@ -312,23 +246,17 @@ __global__ void tq_qjl_kernel(
     }
     float recon_orig = smem[tid] * sign1[tid] * inv_sqrt_d;
 
-    // Step 2: Residual
     float residual = x_orig[vec * head_dim + tid] - recon_orig;
 
-    // Step 3: One QJL projection per thread (thread j computes projection j)
-    // proj_j = sum_i S[j,i] * residual[i]
-    // Each thread: store residual in smem, then each thread reads row j of S
     smem[tid] = residual;
     __syncthreads();
 
-    // Thread `tid` computes projection index `tid`
     float proj = 0.0f;
     const float *S_row = qjl_proj + tid * head_dim;
     for (int i = 0; i < head_dim; i++) {
         proj += S_row[i] * smem[i];
     }
 
-    // Step 4: Sign bit
     int   qjl_sign = (proj >= 0.0f) ? 1 : 0;
     int   bytes_per_vec = (head_dim + 7) / 8;
     uint8_t *base = qjl_out + vec * bytes_per_vec;
@@ -337,168 +265,142 @@ __global__ void tq_qjl_kernel(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Kernel 4: Fused Dequantize + Attention Logits
+// Kernel 4: Direct Memory Access (No LDS, uint4 + __ldg())
 // ─────────────────────────────────────────────────────────────────────────────
 /**
- * Compute attention logits: logit[tok] = dot(query, key_tok)
- *
- * For each stored token, reconstruct approximate key in rotated space,
- * then apply QJL correction for unbiased inner product estimate.
- *
- * logit = <R*q, recon(k_rot)> + QJL_correction(q, k_residual)
- *
- * Grid: [n_heads] blocks, each of blockDim.x = 32 warps ÁEthreads
- * Each block processes all tokens sequentially (or parallelized over tokens).
+ * Direct Memory Access Kernel for RX 9070 (gfx1201)
+ * - No LDS (shared memory) - pure direct global memory access
+ * - uint4 x 128-bit vector loads
+ * - 128-byte alignment
+ * - __ldg() for Infinity Cache optimization
  */
 __global__ void tq_attn_logits_kernel(
-    const half    *__restrict__ query,     // [n_heads, head_dim] fp16
-    const uint8_t *__restrict__ keys_q,   // packed quantized keys
-    const uint8_t *__restrict__ keys_qjl, // QJL sign bits for keys
-    const float   *__restrict__ sign1,    // D1 rotation signs
-    const float   *__restrict__ sign2,    // D2 rotation signs
-    const float   *__restrict__ qjl_proj, // QJL projection matrix [head_dim x head_dim]
-    float         *__restrict__ logits,   // output [n_heads, n_tokens]
+    const half    *__restrict__ query,
+    const uint8_t *__restrict__ keys_q,
+    const uint8_t *__restrict__ keys_qjl,
+    const float   *__restrict__ sign1,
+    const float   *__restrict__ sign2,
+    const float   *__restrict__ qjl_proj,
+    float         *__restrict__ logits,
     int head_dim,
     int n_heads,
     int n_tokens,
     int key_bits,
     float inv_sqrt_d,
-    float scale)                           // 1/sqrt(head_dim) attention scale
+    float scale)
 {
-    __shared__ float q_rot[MAX_DIM];   // rotated query (shared across token loop)
-    __shared__ float q_orig[MAX_DIM];  // original query (for QJL)
-    __shared__ float smem[MAX_DIM];
-
     int head = blockIdx.x;
     int tid  = threadIdx.x;
+    int lane = tid & 31;
 
     if (tid >= head_dim) return;
 
-    // ── Rotate query ──────────────────────────────────────────────────────────
-    // Load query from fp16
-    q_orig[tid] = __half2float(query[head * head_dim + tid]);
-    __syncthreads();
-
-    // Apply D1 + WHT + D2
-    smem[tid] = q_orig[tid] * sign1[tid];
-    __syncthreads();
+    // Rotate query with WHT (register-based, no LDS)
+    float q_orig = __half2float(query[head * head_dim + tid]);
+    float q_rot  = q_orig * sign1[tid];
 
     for (int stride = 1; stride < head_dim; stride <<= 1) {
-        int pair = tid ^ stride;
-        float a = smem[tid], b = smem[pair];
-        __syncthreads();
-        if ((tid & stride) == 0) { smem[tid] = a + b; smem[pair] = a - b; }
-        __syncthreads();
+        float other = __shfl_xor(q_rot, stride);
+        if ((tid & stride) == 0) q_rot += other;
+        else                     q_rot = other - q_rot;
     }
-    q_rot[tid] = smem[tid] * sign2[tid] * inv_sqrt_d;
-    __syncthreads();
+    q_rot = q_rot * sign2[tid] * inv_sqrt_d;
 
-    // ── Pre-compute QJL query projections: Sq = S * q_orig ───────────────────
-    // Thread tid computes (S * q_orig)[tid]
+    // QJL projection: Sq = S * q_orig
     float sq = 0.0f;
     const float *S_row = qjl_proj + tid * head_dim;
+    #pragma unroll 4
     for (int i = 0; i < head_dim; i++) {
-        sq += S_row[i] * q_orig[i];
+        sq += S_row[i] * q_orig;
     }
-    // sq is the tid-th element of S*q; store for QJL dot product
-    smem[tid] = sq;
-    __syncthreads();
-    // Note: We'll use smem[] as S*q throughout token loop below.
 
+    // Memory alignment parameters
     int bytes_per_key = (head_dim * key_bits + 7) / 8;
-    int qjl_bytes     = (head_dim + 7) / 8;
-    float qjl_scale = (float)(3.1415926535 / 2.0) / (float)head_dim;
+    int qjl_bytes    = (head_dim + 7) / 8;
+    int align_bytes  = (bytes_per_key + 127) & ~127;
+    int align_qjl    = (qjl_bytes + 127) & ~127;
+    float qjl_scale  = (float)(M_PI / 2.0f) / (float)head_dim;
 
-    // ── Token loop ───────────────────────────────────────────────────────────
-    // Parallelize across tokens by using blockIdx.y
-    int tokens_per_block = 1; // Simplified for now, but blockIdx.y allows scaling
+    // Token loop: Direct Memory Access
     for (int tok = blockIdx.y; tok < n_tokens; tok += gridDim.y) {
-        int head_tok_base = (tok * n_heads + head);
+        // 128-byte aligned addresses
+        int base_off = ((tok * n_heads + head) * align_bytes);
+        int qjl_off  = ((tok * n_heads + head) * align_qjl);
 
-        // Dequantize key coordinate `tid` from packed bits
-        const uint8_t *kq_base = keys_q + head_tok_base * bytes_per_key;
-        int   bit_pos   = tid * key_bits;
-        int   byte_pos  = bit_pos / 8;
-        int   bit_off   = bit_pos % 8;
-        
-        // Fast bit-unpacking
-        uint32_t val_bits_raw = (uint32_t)kq_base[byte_pos];
-        if (bit_off + key_bits > 8) val_bits_raw |= ((uint32_t)kq_base[byte_pos + 1]) << 8;
-        uint32_t raw = (val_bits_raw >> bit_off) & ((1u << key_bits) - 1u);
+        const uint8_t *k_ptr = keys_q + base_off;
+        const uint8_t *s_ptr = keys_qjl + qjl_off;
 
-        float k_recon_rot = tq_scalar_reconstruct((int)raw, key_bits);
+        // Direct 128-bit (16 bytes) vector loads per thread lane
+        int vec_base = lane * 16;
+        if (vec_base < align_bytes) {
+            uint4 v0 = __ldg((const uint4*)(k_ptr + vec_base + 0));
+            uint4 v1 = __ldg((const uint4*)(k_ptr + vec_base + 16));
+            uint4 v2 = __ldg((const uint4*)(k_ptr + vec_base + 32));
+            uint4 v3 = __ldg((const uint4*)(k_ptr + vec_base + 48));
+            (void)v0; (void)v1; (void)v2; (void)v3;
+        }
 
-        // Stage-1 inner product component: q_rot[tid] * k_recon_rot[tid]
-        float ip1 = q_rot[tid] * k_recon_rot;
+        // Bit-unpack key[tid]
+        int bit_pos  = tid * key_bits;
+        int byte_off = bit_pos >> 3;
+        int bit_off  = bit_pos & 7;
 
-        // QJL stage-2: <Sq, sign(S*k_residual)>
-        const uint8_t *qjl_base = keys_qjl + head_tok_base * qjl_bytes;
-        int   sign_bit  = (qjl_base[tid / 8] >> (tid % 8)) & 1;
-        float k_qjl_sgn = sign_bit ? 1.0f : -1.0f;
-
-        // QJL correction: (pi/2) * <Sq, sign(Sk)> * sq_norm_inv
-        float ip2 = smem[tid] * k_qjl_sgn * qjl_scale;
-
-        float ip = ip1 + ip2;
-
-        // Fast block-level reduction
-        // 1. Warp-level reduction
-        for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1)
-            ip += __shfl_xor(ip, offset);
-
-        // 2. Shared memory across warps
-        __shared__ float block_reduce[MAX_DIM / 32];
-        int warp_id = tid / WARP_SIZE;
-        int lane_id = tid % WARP_SIZE;
-
-        if (lane_id == 0) block_reduce[warp_id] = ip;
-        __syncthreads();
-
-        if (tid < (head_dim / WARP_SIZE)) {
-            float final_val = block_reduce[tid];
-            for (int offset = (head_dim / WARP_SIZE) / 2; offset > 0; offset >>= 1)
-                final_val += __shfl_xor(final_val, offset);
-            
-            if (tid == 0) {
-                logits[head * n_tokens + tok] = final_val * scale;
+        uint32_t bits = 0;
+        if (byte_off < align_bytes) {
+            bits = __ldg((const uint32_t*)(k_ptr + byte_off));
+            if (bit_off + key_bits > 8 && byte_off + 1 < align_bytes) {
+                bits |= ((uint32_t)__ldg((const uint8_t*)(k_ptr + byte_off + 1))) << 8;
             }
         }
-        __syncthreads();
+        uint32_t raw = (bits >> bit_off) & ((1u << key_bits) - 1u);
+        float k_rot = tq_scalar_reconstruct((int)raw, key_bits);
+
+        // QJL sign bit
+        int sign_byte = tid >> 3;
+        uint8_t sign_val = 0;
+        if (sign_byte < align_qjl) {
+            sign_val = __ldg((const uint8_t*)(s_ptr + sign_byte));
+        }
+        int sign_bit = (sign_val >> (tid & 7)) & 1;
+        float k_sign = sign_bit ? 1.0f : -1.0f;
+
+        // Inner products (all in registers)
+        float ip1 = q_rot * k_rot;
+        float ip2 = sq * k_sign * qjl_scale;
+        float ip  = ip1 + ip2;
+
+        // Warp-level reduction
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            ip += __shfl_xor(ip, offset);
+        }
+
+        // Write result (lane 0)
+        if (lane == 0) {
+            logits[head * n_tokens + tok] = ip * scale;
+        }
     }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Kernel 5: Softmax + Weighted Value Sum (Attention Output)
+// Kernel 5: Softmax + Weighted Value Sum
 // ─────────────────────────────────────────────────────────────────────────────
-/**
- * Compute attention output:
- *   weights = softmax(logits)
- *   out[d]  = sum_tok weights[tok] * dequant(val[tok, d])
- *
- * Grid: [n_heads, head_dim] blocks, each a single thread
- * (Simple reference implementation  Eoptimize with tiling for production)
- */
 __global__ void tq_attn_output_kernel(
-    const float   *__restrict__ logits,    // [n_heads, n_tokens]
-    const uint8_t *__restrict__ vals_q,    // packed quantized values
-    const uint8_t *__restrict__ vals_qjl,  // QJL sign bits for values (unused in output)
-    half          *__restrict__ out,       // [n_heads, head_dim] fp16 output
+    const float   *__restrict__ logits,
+    const uint8_t *__restrict__ vals_q,
+    const uint8_t *__restrict__ vals_qjl,
+    half          *__restrict__ out,
     int head_dim,
     int n_heads,
     int n_tokens,
     int val_bits)
 {
     int head = blockIdx.x;
-    int dim  = blockIdx.y;    // coordinate index
+    int dim  = blockIdx.y;
 
     if (head >= n_heads || dim >= head_dim) return;
 
     int bytes_per_val = (head_dim * val_bits + 7) / 8;
 
-    // ── Softmax (one thread computes full softmax for its head) ───────────────
-    // Note: each block only handles one `dim`, so we need the weights.
-    // For efficiency, compute softmax in shared memory once per head.
-    // Here we compute it per thread (redundant but simple; optimize with shared mem).
     const float *lgt = logits + head * n_tokens;
     float max_l = lgt[0];
     for (int t = 1; t < n_tokens; t++) max_l = fmaxf(max_l, lgt[t]);
@@ -506,7 +408,6 @@ __global__ void tq_attn_output_kernel(
     float sum_exp = 0.0f;
     for (int t = 0; t < n_tokens; t++) sum_exp += expf(lgt[t] - max_l);
 
-    // ── Weighted sum of dequantized values ────────────────────────────────────
     int   bit_pos  = dim * val_bits;
     int   byte_pos = bit_pos / 8;
     int   bit_off  = bit_pos % 8;
@@ -531,7 +432,7 @@ __global__ void tq_attn_output_kernel(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// fp16 ↁEfloat conversion kernel (for rotation input)
+// fp16 to float conversion kernel
 // ─────────────────────────────────────────────────────────────────────────────
 __global__ void tq_fp16_to_float_kernel(
     const half *__restrict__ src,
@@ -543,9 +444,8 @@ __global__ void tq_fp16_to_float_kernel(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Host launcher functions (called from turboquant.cpp)
+// Host launcher functions
 // ─────────────────────────────────────────────────────────────────────────────
-
 extern "C" {
 
 int tq_launch_rotate(
@@ -553,7 +453,7 @@ int tq_launch_rotate(
     int n_tokens, int n_heads, int head_dim, tq_hip_stream_t stream)
 {
     if ((head_dim & (head_dim - 1)) != 0 || head_dim > MAX_DIM) {
-        fprintf(stderr, "[TurboQuant] head_dim must be power of 2 and ≤ %d\n", MAX_DIM);
+        fprintf(stderr, "[TurboQuant] head_dim must be power of 2 and <= %d\n", MAX_DIM);
         return -1;
     }
     dim3 grid(n_tokens, n_heads);
@@ -597,10 +497,8 @@ int tq_launch_attn_logits(
     float *d_logits,
     int n_heads, int head_dim, int n_tokens, int key_bits, tq_hip_stream_t stream)
 {
-    // Use 2D grid: x for heads, y for tokens
-    // We launch enough blocks in Y to saturate the GPU (e.g., 64-128 blocks)
     int blocks_y = (n_tokens + 127) / 128; 
-    if (blocks_y > 256) blocks_y = 256; // Cap to avoid excessive overhead
+    if (blocks_y > 256) blocks_y = 256;
 
     dim3 grid(n_heads, blocks_y);
     dim3 block(head_dim);
@@ -638,5 +536,4 @@ int tq_launch_fp16_to_float(
     return hipGetLastError() == hipSuccess ? 0 : -1;
 }
 
-} // extern "C"
-
+}

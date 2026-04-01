@@ -1,4 +1,4 @@
-#include "llama-context.h"
+﻿#include "llama-context.h"
 #include "turboquant.h"
 
 #include "llama-arch.h"
@@ -32,9 +32,13 @@ llama_context::llama_context(
     LLAMA_LOG_INFO("%s: constructing llama_context\n", __func__);
 
 #ifdef LLAMA_TURBOQUANT
-    // Force shrink standard KV cache to the minimum valid type (IQ1_S) to save VRAM.
-    params.type_k = GGML_TYPE_IQ1_S;
-    params.type_v = GGML_TYPE_IQ1_S;
+    // NOTE: TurboQuant hooks (llama_tq_store_k, llama_tq_attn) are not yet
+    // integrated into llama.cpp's KV storage and attention paths.
+    // Forcing IQ1_S here causes crashes because the standard ggml_set_rows
+    // and ggml_flash_attn_ext operations cannot handle IQ1_S on HIP backend.
+    // Use standard FP16 KV cache until TurboQuant integration is complete.
+    // params.type_k = GGML_TYPE_IQ1_S;
+    // params.type_v = GGML_TYPE_IQ1_S;
 #endif
 
     t_start_us = model.t_start_us;
@@ -370,15 +374,22 @@ llama_context::llama_context(
         }
     }
 
-    // [TurboQuant Force-Enabled]
-    this->tq_ctx = llama_tq_create(
-        model.hparams.n_layer,
-        model.hparams.n_head_kv(0),
-        model.hparams.n_embd_head_k(0),
-        cparams.n_ctx,
-        3,  // key bits
-        2); // val bits
-    llama_tq_set_global(this->tq_ctx);
+#ifdef LLAMA_TURBOQUANT
+    // Initialize TurboQuant integration
+    this->tq = new turboquant_integration::llama_tq_integration();
+    if (!this->tq->init(
+            model.hparams.n_layer,
+            model.hparams.n_head_kv(0),
+            model.hparams.n_embd_head_k(0),
+            cparams.n_ctx,
+            3,  // key bits
+            2)) // val bits
+    {
+        delete this->tq;
+        this->tq = nullptr;
+        LLAMA_LOG_WARN("%s: TurboQuant initialization failed, continuing without TQ\n", __func__);
+    }
+#endif
 }
 
 llama_context::~llama_context() {
@@ -400,10 +411,13 @@ llama_context::~llama_context() {
     }
     ggml_opt_free(opt_ctx);
 
-    if (this->tq_ctx) {
-        llama_tq_free(this->tq_ctx);
-        this->tq_ctx = nullptr;
+#ifdef LLAMA_TURBOQUANT
+    if (this->tq) {
+        this->tq->shutdown();
+        delete this->tq;
+        this->tq = nullptr;
     }
+#endif
 }
 
 void llama_context::sched_reserve() {

@@ -145,8 +145,27 @@ endif()
 target_link_libraries(ggml-hip PRIVATE ggml-base hip::host roc::rocblas roc::hipblas)
 
 if (LLAMA_TURBOQUANT)
-    add_subdirectory(../turboquant_rocm turboquant_rocm)
-    target_link_libraries(ggml-hip PRIVATE turboquant_rocm)
+    set(TQ_DIR "../turboquant_rocm")
+    target_sources(ggml-hip PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/${TQ_DIR}/turboquant.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/${TQ_DIR}/llama_tq_hook.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/${TQ_DIR}/tq_hooks.hip"
+    )
+    target_include_directories(ggml-hip PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src/turboquant_rocm)
+    target_include_directories(ggml-hip PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
     add_compile_definitions(LLAMA_TURBOQUANT)
+    
+    # Add HIP include path for turboquant
+    target_include_directories(ggml-hip PRIVATE "C:/Program Files/AMD/ROCm/7.1/include")
+endif()
+
+# On Windows, mark all .hip files as C++ since HIP language isn't fully supported
+if (WIN32)
+    get_target_property(TQ_SOURCES ggml-hip SOURCES)
+    foreach(src IN LISTS TQ_SOURCES)
+        if(src MATCHES "\\.hip$")
+            set_source_files_properties(${src} PROPERTIES LANGUAGE CXX)
+        endif()
+    endforeach()
 endif()
 

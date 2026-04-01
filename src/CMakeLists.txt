@@ -148,6 +148,7 @@ add_library(llama
             models/t5-enc.cpp
             models/wavtokenizer-dec.cpp
             models/xverse.cpp
+            turboquant_integration.cpp
             )
 
 set_target_properties(llama PROPERTIES
@@ -161,9 +162,10 @@ if (GGML_HIP)
     target_include_directories(llama PRIVATE "C:/Program Files/AMD/ROCm/7.1/include")
     target_compile_definitions(llama PRIVATE __HIP_PLATFORM_AMD__=1)
 endif()
-if (LLAMA_TURBOQUANT)
-    target_compile_definitions(llama PRIVATE LLAMA_TURBOQUANT)
-endif()
+# Disable TurboQuant integration in llama for now - it will be handled by ggml-hip.dll
+# if (LLAMA_TURBOQUANT)
+#     target_compile_definitions(llama PRIVATE LLAMA_TURBOQUANT)
+# endif()
 target_include_directories(llama PUBLIC ../include)
 target_compile_features   (llama PRIVATE cxx_std_17) # don't bump
 

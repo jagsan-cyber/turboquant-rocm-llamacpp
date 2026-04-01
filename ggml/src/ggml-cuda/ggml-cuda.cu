@@ -1,9 +1,14 @@
 #include "ggml-cuda.h"
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
+#ifdef LLAMA_TURBOQUANT
 #include "turboquant.h"
-#include "ggml-impl.h"
-#include "ggml-backend-impl.h"
+#endif
+
+// Forward declarations for external hooks in tq_hooks.cu
+struct ggml_backend_cuda_context;
+extern "C" bool tq_on_set_rows(ggml_backend_cuda_context & ctx, const ggml_tensor * dst);
+extern "C" bool tq_on_flash_attn(ggml_backend_cuda_context & ctx, const ggml_tensor * dst);
 
 #include "ggml-cuda/common.cuh"
 #include "ggml-cuda/acc.cuh"
@@ -65,16 +70,6 @@
 #include "ggml-cuda/cumsum.cuh"
 #include "ggml-cuda/fill.cuh"
 #include "ggml.h"
-
-#if defined(GGML_USE_HIP) && defined(LLAMA_TURBOQUANT)
-extern "C" {
-    struct llama_tq_context;
-    struct llama_tq_context * llama_tq_get_global(void);
-    int llama_tq_store_k(struct llama_tq_context * ctx, int layer, int start_token, const void * d_keys_f32, int n_tokens, const int * d_indices);
-    int llama_tq_store_v(struct llama_tq_context * ctx, int layer, int start_token, const void * d_vals_f32, int n_tokens, const int * d_indices);
-    int llama_tq_attn(struct llama_tq_context * ctx, int layer, const float * d_query, float * d_logits_out, float * d_output, int n_heads_q, int n_queries, int n_tokens_kv);
-}
-#endif
 
 #include <algorithm>
 #include <array>
@@ -2521,29 +2516,29 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             ggml_cuda_op_get_rows_back(ctx, dst);
             break;
         case GGML_OP_SET_ROWS:
-#if defined(GGML_USE_HIP) && defined(LLAMA_TURBOQUANT)
             {
+#ifdef LLAMA_TURBOQUANT
                 if (dst->src[0]->type == GGML_TYPE_IQ1_S) {
                     struct llama_tq_context * tq = llama_tq_get_global();
                     ggml_tensor * target = dst->src[0]->view_src ? dst->src[0]->view_src : dst->src[0];
                     if (tq && target->name[0] != '\0') {
-                        const int * d_indices = (const int *)dst->src[2]->data;
+                        const int * d_indices = dst->src[2] ? (const int *)dst->src[2]->data : nullptr;
                         if (strncmp(target->name, "cache_k_l", 9) == 0) {
                             try {
-                                int il = std::stoi(target->name + 9);
+                                int il = std::atoi(target->name + 9);
                                 llama_tq_store_k(tq, il, 0, dst->src[1]->data, dst->src[1]->ne[1], d_indices);
                             } catch (...) {}
                         } else if (strncmp(target->name, "cache_v_l", 9) == 0) {
                             try {
-                                int il = std::stoi(target->name + 9);
+                                int il = std::atoi(target->name + 9);
                                 llama_tq_store_v(tq, il, 0, dst->src[1]->data, dst->src[1]->ne[1], d_indices);
                             } catch (...) {}
                         }
                     }
-                    break; // Unconditionally break for IQ1_S to prevent unsupported type crash!
+                    return true; // ALWAYS SKIP FOR IQ1_S
                 }
-            }
 #endif
+            }
             ggml_cuda_op_set_rows(ctx, dst);
             break;
         case GGML_OP_SET:
@@ -2815,40 +2810,13 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             ggml_cuda_op_argsort(ctx, dst);
             break;
         case GGML_OP_FLASH_ATTN_EXT:
-#if defined(GGML_USE_HIP) && defined(LLAMA_TURBOQUANT)
-    {
-        struct llama_tq_context * tq = llama_tq_get_global();
-        if (tq) {
-            // 名前チェックをやめて、無条件でTQを使う
-            // dst->src[0] = query, dst->src[1] = key, dst->src[2] = value
-            // レイヤー番号はdst->src[1]の名前から取る
-            ggml_tensor * k_tensor = dst->src[1];
-            ggml_tensor * target = k_tensor->view_src ? k_tensor->view_src : k_tensor;
-            if (target->name[0] != '\0' && 
-                strncmp(target->name, "cache_k_l", 9) == 0) {
-                try {
-                    int il = std::stoi(target->name + 9);
-                    int n_heads_q = dst->src[0]->ne[2];
-                    int n_queries = dst->src[0]->ne[1];
-
-                    // デバッグ出力: 型番号を確認 (0=F32, 1=F16)
-                    fprintf(stderr, "[TQ DEBUG] L%d | Q type: %d, Out type: %d | heads: %d, queries: %d\n", 
-                           il, dst->src[0]->type, dst->type, n_heads_q, n_queries);
-                    fflush(stderr);
-
-                    int r = llama_tq_attn(tq, il, 
-                                          (const float *)dst->src[0]->data, // 【修正】const float* へ明示的にキャスト
-                                          nullptr, 
-                                          (float *)dst->data,               // 【修正】float* へ明示的にキャスト
-                                          n_heads_q, n_queries, n_tokens_kv);
-                    if (r == 0) break;  // 成功したときだけスキップ
-                } catch (...) {}
+#ifdef LLAMA_TURBOQUANT
+            if (tq_on_flash_attn(ctx, dst)) {
+                return true;
             }
-        }
-    }
 #endif
-    ggml_cuda_flash_attn_ext(ctx, dst);
-    break;
+            ggml_cuda_flash_attn_ext(ctx, dst);
+            break;
         case GGML_OP_CROSS_ENTROPY_LOSS:
             ggml_cuda_cross_entropy_loss(ctx, dst);
             break;
