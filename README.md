@@ -93,6 +93,6 @@ ninja -C build
 ```
 
 ## Files
-- dll.zip - Pre-built DLLs (llama.dll, ggml-hip.dll, etc.)
+- [dll.zip](https://github.com/jagsan-cyber/turboquant-rocm-llamacpp/releases/tag/v1.1.0) - Pre-built DLLs (llama.dll, ggml-hip.dll, etc.)
 - turboquant_changes.patch - Source code patch for custom builds
 - README.md - This file
