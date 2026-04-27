@@ -8535,6 +8535,9 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         };
                     }
 
+                    ggml_type force_type_k = params.type_k;
+                        ggml_type force_type_v = params.type_v;
+
                     if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
                         GGML_ASSERT(hparams.is_swa_any());
 
@@ -8554,9 +8557,6 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                 reuse);
                     } else {
                         GGML_ASSERT(!hparams.is_swa_any());
-
-                        ggml_type force_type_k = params.type_k;
-                        ggml_type force_type_v = params.type_v;
 
 #if defined(GGML_USE_HIP) && defined(LLAMA_TURBOQUANT)
                         if (this->tq != nullptr) {
